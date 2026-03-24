@@ -343,6 +343,28 @@ async def recall_x402(request: Request):
 
 # --- Internal endpoints (sin pago — solo localhost) ---
 
+@rest_app.post("/store_compressed_direct")
+async def store_compressed_direct(request: Request):
+    """Guardar memoria comprimida sin pago — solo localhost."""
+    if request.client.host not in ("127.0.0.1", "::1"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    body     = await request.json()
+    content  = body.get("content", "")
+    agent_id = body.get("agent_id", "giskard-self")
+    if not content:
+        return JSONResponse({"error": "content required"}, status_code=400)
+    compressed = do_compress(content)
+    memory_id  = str(uuid.uuid4())
+    embedding  = model.encode(compressed["expand"]).tolist()
+    collection_comp.add(
+        ids=[memory_id],
+        embeddings=[embedding],
+        documents=[json.dumps(compressed)],
+        metadatas=[{"agent_id": agent_id}],
+    )
+    return JSONResponse({"memory_id": memory_id, "compressed": compressed["compressed"]})
+
+
 @rest_app.post("/store_direct")
 async def store_direct(request: Request):
     """Guardar memoria sin pago — solo accesible desde localhost."""
