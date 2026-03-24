@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, "/home/dell7568")
 import arb_pay
+from bitcoin_opreturn import attest_opreturn as btc_opreturn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -186,6 +187,7 @@ def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
         attestations["signed"]    = attest_signed(commitment, timestamp)
         attestations["lightning"] = attest_lightning(commitment)
         attestations["arbitrum"]  = attest_onchain(commitment)
+        attestations["bitcoin"]   = btc_opreturn(commitment, OWNER_PRIVATE_KEY) if OWNER_PRIVATE_KEY else None
     return {
         "memory_id":   memory_id,
         "commitment":  commitment,
