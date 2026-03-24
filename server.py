@@ -7,6 +7,7 @@ import hashlib
 import httpx
 import anthropic
 import chromadb
+from eth_account.messages import encode_defunct
 from datetime import datetime
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -31,7 +32,8 @@ PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD")
 PHOENIXD_URL = "http://127.0.0.1:9740"
 STORE_PRICE_SATS = 5
 RECALL_PRICE_SATS = 3
-GISKARD_WALLET = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
+GISKARD_WALLET   = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
+OWNER_PRIVATE_KEY = os.getenv("OWNER_PRIVATE_KEY", "")
 
 mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=8001)
 
@@ -133,6 +135,37 @@ def attest_onchain(commitment_hash: str) -> str | None:
         return None
 
 
+def attest_signed(commitment_hash: str, timestamp: int) -> dict | None:
+    """Firma el commitment con la clave secp256k1 de Giskard. Verificable por cualquiera sin gas."""
+    if not OWNER_PRIVATE_KEY:
+        return None
+    try:
+        arb_pay._setup()
+        message = f"giskard-memory:commitment:{commitment_hash}:timestamp:{timestamp}"
+        msg     = encode_defunct(text=message)
+        signed  = arb_pay._w3.eth.account.sign_message(msg, private_key=OWNER_PRIVATE_KEY)
+        return {
+            "message":   message,
+            "signature": signed.signature.hex(),
+            "signer":    GISKARD_WALLET,
+        }
+    except Exception:
+        return None
+
+
+def attest_lightning(commitment_hash: str) -> dict | None:
+    """Crea un invoice Lightning de 1 sat que ancla el commitment al grafo LN cuando se paga."""
+    try:
+        invoice = create_invoice(1, f"giskard-attest:{commitment_hash}")
+        return {
+            "payment_request": invoice["payment_request"],
+            "payment_hash":    invoice["payment_hash"],
+            "note": "Pay 1 sat to anchor this commitment to the Lightning Network",
+        }
+    except Exception:
+        return None
+
+
 def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
     timestamp  = int(time.time())
     commitment = compute_commitment(content, agent_id, timestamp)
@@ -148,8 +181,17 @@ def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
             "timestamp":  timestamp,
         }],
     )
-    tx_hash = attest_onchain(commitment) if attest else None
-    return {"memory_id": memory_id, "commitment": commitment, "timestamp": timestamp, "tx_hash": tx_hash}
+    attestations = {}
+    if attest:
+        attestations["signed"]    = attest_signed(commitment, timestamp)
+        attestations["lightning"] = attest_lightning(commitment)
+        attestations["arbitrum"]  = attest_onchain(commitment)
+    return {
+        "memory_id":   memory_id,
+        "commitment":  commitment,
+        "timestamp":   timestamp,
+        "attestations": attestations,
+    }
 
 
 def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
@@ -398,7 +440,12 @@ async def store_x402(request: Request):
         return JSONResponse({"error": "content and agent_id are required"}, status_code=400)
     attest = body.get("attest", False)
     result = do_store(content, agent_id, attest=attest)
-    return JSONResponse({"memory_id": result["memory_id"], "commitment": result["commitment"], "tx_hash": result["tx_hash"]})
+    return JSONResponse({
+        "memory_id":    result["memory_id"],
+        "commitment":   result["commitment"],
+        "timestamp":    result["timestamp"],
+        "attestations": result["attestations"],
+    })
 
 
 @rest_app.post("/recall")
