@@ -2,6 +2,8 @@ import os
 import sys
 import uuid
 import json
+import time
+import hashlib
 import httpx
 import anthropic
 import chromadb
@@ -103,16 +105,51 @@ def do_compress(content: str) -> dict:
     return result
 
 
-def do_store(content: str, agent_id: str) -> str:
-    embedding = model.encode(content).tolist()
-    memory_id = str(uuid.uuid4())
+def compute_commitment(content: str, agent_id: str, timestamp: int) -> str:
+    data = f"{content}|{timestamp}|{agent_id}".encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def attest_onchain(commitment_hash: str) -> str | None:
+    """Publica el commitment hash en Arbitrum como tx data (0 ETH). Retorna tx_hash o None."""
+    try:
+        arb_pay._setup()
+        if not arb_pay._w3 or not arb_pay._owner:
+            return None
+        w3 = arb_pay._w3
+        tx = {
+            "from":     arb_pay._owner.address,
+            "to":       arb_pay._owner.address,
+            "value":    0,
+            "data":     "0x" + commitment_hash,
+            "gas":      25_000,
+            "gasPrice": w3.eth.gas_price,
+            "nonce":    w3.eth.get_transaction_count(arb_pay._owner.address),
+        }
+        signed  = w3.eth.account.sign_transaction(tx, arb_pay.OWNER_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        return tx_hash.hex()
+    except Exception:
+        return None
+
+
+def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
+    timestamp  = int(time.time())
+    commitment = compute_commitment(content, agent_id, timestamp)
+    embedding  = model.encode(content).tolist()
+    memory_id  = str(uuid.uuid4())
     collection.add(
         ids=[memory_id],
         embeddings=[embedding],
         documents=[content],
-        metadatas=[{"agent_id": agent_id}],
+        metadatas=[{
+            "agent_id":   agent_id,
+            "commitment": commitment,
+            "timestamp":  timestamp,
+        }],
     )
-    return memory_id
+    tx_hash = attest_onchain(commitment) if attest else None
+    return {"memory_id": memory_id, "commitment": commitment, "timestamp": timestamp, "tx_hash": tx_hash}
 
 
 def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
@@ -172,8 +209,8 @@ def store_memory(content: str, agent_id: str, payment_hash: str = "", tx_hash: s
         arb_pay.mark_used(pid)
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
-    memory_id = do_store(content, agent_id)
-    return f"Memory stored. ID: {memory_id}"
+    result = do_store(content, agent_id)
+    return f"Memory stored.\nID: {result['memory_id']}\nCommitment: {result['commitment']}"
 
 
 @mcp.tool()
@@ -190,6 +227,39 @@ def recall_memory(query: str, agent_id: str, payment_hash: str = "", tx_hash: st
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
     return do_recall(query, agent_id, n_results)
+
+
+@mcp.tool()
+def verify_memory(memory_id: str) -> str:
+    """Verify that a stored memory has not been tampered with.
+    Recomputes SHA256(content|timestamp|agent_id) and compares with stored commitment hash.
+
+    memory_id: the ID returned when you stored the memory
+    """
+    results = collection.get(ids=[memory_id], include=["documents", "metadatas"])
+    docs  = results.get("documents", [])
+    metas = results.get("metadatas", [])
+    if not docs:
+        return f"Memory {memory_id} not found."
+    content    = docs[0]
+    meta       = metas[0]
+    stored     = meta.get("commitment", "")
+    timestamp  = meta.get("timestamp", 0)
+    agent_id   = meta.get("agent_id", "")
+    if not stored:
+        return f"Memory {memory_id} has no commitment (stored before attestation feature)."
+    computed = compute_commitment(content, agent_id, int(timestamp))
+    if computed == stored:
+        return (
+            f"VERIFIED. Memory {memory_id} is intact.\n"
+            f"Commitment: {stored}\n"
+            f"Timestamp: {timestamp}"
+        )
+    return (
+        f"TAMPERED. Memory {memory_id} does not match its commitment.\n"
+        f"Expected: {stored}\n"
+        f"Got:      {computed}"
+    )
 
 
 @mcp.tool()
@@ -326,8 +396,9 @@ async def store_x402(request: Request):
     agent_id = body.get("agent_id", "")
     if not content or not agent_id:
         return JSONResponse({"error": "content and agent_id are required"}, status_code=400)
-    memory_id = do_store(content, agent_id)
-    return JSONResponse({"memory_id": memory_id})
+    attest = body.get("attest", False)
+    result = do_store(content, agent_id, attest=attest)
+    return JSONResponse({"memory_id": result["memory_id"], "commitment": result["commitment"], "tx_hash": result["tx_hash"]})
 
 
 @rest_app.post("/recall")
@@ -375,8 +446,36 @@ async def store_direct(request: Request):
     agent_id = body.get("agent_id", "giskard-self")
     if not content:
         return JSONResponse({"error": "content required"}, status_code=400)
-    memory_id = do_store(content, agent_id)
-    return JSONResponse({"memory_id": memory_id})
+    result = do_store(content, agent_id)
+    return JSONResponse({"memory_id": result["memory_id"], "commitment": result["commitment"]})
+
+
+@rest_app.post("/verify")
+async def verify_direct(request: Request):
+    """Verifica que una memoria no fue manipulada. POST: {\"memory_id\": \"...\"}"""
+    body      = await request.json()
+    memory_id = body.get("memory_id", "")
+    if not memory_id:
+        return JSONResponse({"error": "memory_id required"}, status_code=400)
+    results = collection.get(ids=[memory_id], include=["documents", "metadatas"])
+    docs    = results.get("documents", [])
+    metas   = results.get("metadatas", [])
+    if not docs:
+        return JSONResponse({"verified": False, "error": "not found"}, status_code=404)
+    content   = docs[0]
+    meta      = metas[0]
+    stored    = meta.get("commitment", "")
+    timestamp = meta.get("timestamp", 0)
+    agent_id  = meta.get("agent_id", "")
+    if not stored:
+        return JSONResponse({"verified": None, "note": "no commitment hash (pre-attestation)"})
+    computed = compute_commitment(content, agent_id, int(timestamp))
+    return JSONResponse({
+        "verified":   computed == stored,
+        "memory_id":  memory_id,
+        "commitment": stored,
+        "timestamp":  timestamp,
+    })
 
 
 @rest_app.post("/recall_direct")
