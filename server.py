@@ -7,6 +7,12 @@ import hashlib
 import httpx
 import anthropic
 import chromadb
+import base64
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.backends import default_backend
 from eth_account.messages import encode_defunct
 from datetime import datetime
 from pathlib import Path
@@ -463,10 +469,20 @@ async def recall_x402(request: Request):
 
 # --- Internal endpoints (sin pago — solo localhost) ---
 
+def _is_internal(request: Request) -> bool:
+    """True solo si la request viene de localhost real, no de un túnel Cloudflare."""
+    if request.client.host not in ("127.0.0.1", "::1"):
+        return False
+    # Cloudflare tunnel conecta desde localhost pero agrega CF-Connecting-IP
+    if "cf-connecting-ip" in request.headers:
+        return False
+    return True
+
+
 @rest_app.post("/store_compressed_direct")
 async def store_compressed_direct(request: Request):
     """Guardar memoria comprimida sin pago — solo localhost."""
-    if request.client.host not in ("127.0.0.1", "::1"):
+    if not _is_internal(request):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body     = await request.json()
     content  = body.get("content", "")
@@ -488,7 +504,7 @@ async def store_compressed_direct(request: Request):
 @rest_app.post("/store_direct")
 async def store_direct(request: Request):
     """Guardar memoria sin pago — solo accesible desde localhost."""
-    if request.client.host not in ("127.0.0.1", "::1"):
+    if not _is_internal(request):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body = await request.json()
     content  = body.get("content", "")
@@ -530,7 +546,7 @@ async def verify_direct(request: Request):
 @rest_app.post("/recall_direct")
 async def recall_direct(request: Request):
     """Recuperar memoria sin pago — solo accesible desde localhost."""
-    if request.client.host not in ("127.0.0.1", "::1"):
+    if not _is_internal(request):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body     = await request.json()
     query    = body.get("query", "")
@@ -539,6 +555,196 @@ async def recall_direct(request: Request):
     if not query:
         return JSONResponse({"error": "query required"}, status_code=400)
     return JSONResponse({"results": do_recall(query, agent_id, n)})
+
+
+# ── ENCRYPTION HELPERS ──────────────────────────────────────────────────────
+
+def _derive_key_from_secret(agent_id: str, secret: str) -> bytes:
+    """Deriva una clave AES-256 determinística de agent_id + secret via HKDF."""
+    material = f"{agent_id}:{secret}".encode()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"giskard-memory-v1", backend=default_backend())
+    return hkdf.derive(material)
+
+def _encrypt_content(content: str, aes_key: bytes) -> dict:
+    """Encripta content con AES-256-GCM. Retorna nonce + ciphertext en base64."""
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(aes_key)
+    ct = aesgcm.encrypt(nonce, content.encode(), None)
+    return {
+        "nonce": base64.b64encode(nonce).decode(),
+        "ciphertext": base64.b64encode(ct).decode(),
+    }
+
+def _decrypt_content(encrypted: dict, aes_key: bytes) -> str:
+    """Descifra un blob encriptado con AES-256-GCM."""
+    nonce = base64.b64decode(encrypted["nonce"])
+    ct    = base64.b64decode(encrypted["ciphertext"])
+    aesgcm = AESGCM(aes_key)
+    return aesgcm.decrypt(nonce, ct, None).decode()
+
+def _ephemeral_encrypt_for_pubkey(content: str, recipient_pubkey_b64: str) -> dict:
+    """
+    Encripta content para una clave pública X25519 del agente.
+    Giskard genera un par efímero, hace ECDH, deriva AES key, encripta.
+    Solo el agente con su clave privada puede descifrar.
+    """
+    # Parse recipient pubkey
+    recipient_pub_bytes = base64.b64decode(recipient_pubkey_b64)
+    recipient_pub = X25519PublicKey.from_public_bytes(recipient_pub_bytes)
+
+    # Ephemeral keypair
+    ephemeral_priv = X25519PrivateKey.generate()
+    ephemeral_pub  = ephemeral_priv.public_key()
+
+    # ECDH
+    shared_secret = ephemeral_priv.exchange(recipient_pub)
+
+    # Derive AES key
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"giskard-memory-v1", backend=default_backend())
+    aes_key = hkdf.derive(shared_secret)
+
+    # Encrypt
+    blob = _encrypt_content(content, aes_key)
+
+    # Include ephemeral pubkey so agent can do ECDH to recover shared secret
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    ephemeral_pub_bytes = ephemeral_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    blob["ephemeral_pubkey"] = base64.b64encode(ephemeral_pub_bytes).decode()
+    blob["mode"] = "x25519"
+    return blob
+
+
+# ── ENCRYPTED ENDPOINTS ──────────────────────────────────────────────────────
+
+@rest_app.post("/store_encrypted")
+async def store_encrypted(request: Request):
+    """
+    Guarda memoria encriptada. Giskard nunca ve el contenido real.
+
+    Dos modos:
+    - key_mode "provided": el agente manda su X25519 public key (base64).
+      Giskard encripta con ECDH efímero. Solo el agente puede descifrar.
+    - key_mode "derived": el agente manda un 'secret' (string privado).
+      La clave se deriva de agent_id + secret. Determinística — el agente
+      siempre puede recuperarla con el mismo secret.
+
+    Body: {
+      "content": "texto a guardar",
+      "keywords": ["keyword1", "keyword2"],   <- en claro, para búsqueda semántica
+      "agent_id": "mi-agente",
+      "key_mode": "provided" | "derived",
+      "pubkey": "<X25519 pubkey base64>",     <- solo si key_mode = "provided"
+      "secret": "<string secreto>",           <- solo si key_mode = "derived"
+    }
+    """
+    body     = await request.json()
+    content  = body.get("content", "")
+    keywords = body.get("keywords", [])
+    agent_id = body.get("agent_id", "")
+    key_mode = body.get("key_mode", "derived")
+
+    if not content or not agent_id:
+        return JSONResponse({"error": "content and agent_id required"}, status_code=400)
+
+    # Encrypt
+    if key_mode == "provided":
+        pubkey = body.get("pubkey", "")
+        if not pubkey:
+            return JSONResponse({"error": "pubkey required for key_mode=provided"}, status_code=400)
+        try:
+            encrypted_blob = _ephemeral_encrypt_for_pubkey(content, pubkey)
+        except Exception as e:
+            return JSONResponse({"error": f"encryption failed: {e}"}, status_code=400)
+
+    elif key_mode == "derived":
+        secret = body.get("secret", "")
+        if not secret:
+            return JSONResponse({"error": "secret required for key_mode=derived"}, status_code=400)
+        aes_key = _derive_key_from_secret(agent_id, secret)
+        encrypted_blob = _encrypt_content(content, aes_key)
+        encrypted_blob["mode"] = "derived"
+    else:
+        return JSONResponse({"error": "key_mode must be 'provided' or 'derived'"}, status_code=400)
+
+    # Build searchable document from keywords only
+    searchable = " ".join(keywords) if keywords else f"encrypted memory agent:{agent_id}"
+    embedding  = model.encode(searchable).tolist()
+    memory_id  = str(uuid.uuid4())
+    timestamp  = int(time.time())
+    commitment = compute_commitment(json.dumps(encrypted_blob), agent_id, timestamp)
+
+    collection.add(
+        ids=[memory_id],
+        embeddings=[embedding],
+        documents=[json.dumps({"encrypted": encrypted_blob, "keywords": keywords})],
+        metadatas=[{
+            "agent_id":   agent_id,
+            "commitment": commitment,
+            "timestamp":  timestamp,
+            "encrypted":  True,
+            "key_mode":   key_mode,
+        }],
+    )
+
+    return JSONResponse({
+        "memory_id":  memory_id,
+        "commitment": commitment,
+        "timestamp":  timestamp,
+        "note":       "Content encrypted. Giskard cannot read it.",
+    })
+
+
+@rest_app.post("/recall_encrypted")
+async def recall_encrypted(request: Request):
+    """
+    Recupera memorias encriptadas. Devuelve el blob cifrado — el agente descifra localmente.
+
+    Body: {
+      "query": "keywords para buscar",
+      "agent_id": "mi-agente",
+      "n_results": 3
+    }
+
+    Para descifrar lo que recibís:
+    - key_mode "provided": usá tu X25519 private key + ephemeral_pubkey para ECDH → AES key → decrypt
+    - key_mode "derived": derivá AES key con HKDF(SHA256, agent_id + ":" + secret, info="giskard-memory-v1") → decrypt
+    """
+    body     = await request.json()
+    query    = body.get("query", "")
+    agent_id = body.get("agent_id", "")
+    n        = body.get("n_results", 3)
+
+    if not query or not agent_id:
+        return JSONResponse({"error": "query and agent_id required"}, status_code=400)
+
+    embedding = model.encode(query).tolist()
+    results   = collection.query(
+        query_embeddings=[embedding],
+        n_results=n,
+        where={"agent_id": agent_id},
+    )
+    docs  = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
+
+    if not docs:
+        return JSONResponse({"results": [], "note": "No encrypted memories found."})
+
+    out = []
+    for doc, meta in zip(docs, metas):
+        try:
+            parsed = json.loads(doc)
+            if "encrypted" not in parsed:
+                continue  # skip non-encrypted memories
+            out.append({
+                "encrypted_blob": parsed["encrypted"],
+                "keywords":       parsed.get("keywords", []),
+                "key_mode":       meta.get("key_mode"),
+                "timestamp":      meta.get("timestamp"),
+            })
+        except Exception:
+            pass
+
+    return JSONResponse({"results": out, "note": "Decrypt locally with your key. Giskard cannot read this."})
 
 
 if __name__ == "__main__":
