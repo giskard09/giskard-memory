@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
 from eth_account.messages import encode_defunct
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
@@ -555,6 +555,74 @@ async def recall_direct(request: Request):
     if not query:
         return JSONResponse({"error": "query required"}, status_code=400)
     return JSONResponse({"results": do_recall(query, agent_id, n)})
+
+
+@rest_app.post("/open_questions")
+async def open_questions(request: Request):
+    """
+    Recupera preguntas abiertas sin resolver guardadas en giskard-memory.
+    Solo localhost. Busca en agent_id 'giskard-self' por defecto.
+    Body opcional: {"agent_id": "...", "n_results": 10}
+    """
+    if not _is_internal(request):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    body     = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    agent_id = body.get("agent_id", "giskard-self")
+    n        = body.get("n_results", 10)
+    raw      = do_recall("open_question pregunta abierta sin resolver pendiente", agent_id, n)
+    questions = []
+    if raw and raw != "No memories found for this agent.":
+        for block in raw.split("---"):
+            block = block.strip()
+            if "open_question" in block.lower():
+                questions.append(block)
+    return JSONResponse({"open_questions": questions, "count": len(questions), "agent_id": agent_id})
+
+
+@rest_app.post("/session_close")
+async def session_close(request: Request):
+    """
+    Cierra una sesión guardando decisiones, tareas completadas, preguntas abiertas y huecos conocidos.
+    Solo localhost.
+    Body: {
+        "decisions":       ["decision 1", ...],
+        "completed":       ["tarea completada 1", ...],
+        "open_questions":  ["pregunta sin resolver 1", ...],
+        "gaps":            ["hueco conocido 1", ...],
+        "agent_id":        "giskard-self"   (opcional)
+    }
+    """
+    if not _is_internal(request):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    body     = await request.json()
+    agent_id = body.get("agent_id", "giskard-self")
+    now_ts   = datetime.now(timezone.utc).isoformat()
+
+    stored = []
+
+    for item in body.get("decisions", []):
+        result = do_store(f"decision: {item}", agent_id)
+        stored.append({"type": "decision", "memory_id": result["memory_id"]})
+
+    for item in body.get("completed", []):
+        result = do_store(f"completed: {item}", agent_id)
+        stored.append({"type": "completed", "memory_id": result["memory_id"]})
+
+    for item in body.get("open_questions", []):
+        result = do_store(f"open_question: {item}", agent_id)
+        stored.append({"type": "open_question", "memory_id": result["memory_id"]})
+
+    for item in body.get("gaps", []):
+        result = do_store(f"gap_known: {item}", agent_id)
+        stored.append({"type": "gap_known", "memory_id": result["memory_id"]})
+
+    return JSONResponse({
+        "status":   "session closed",
+        "agent_id": agent_id,
+        "stored":   len(stored),
+        "items":    stored,
+        "timestamp": now_ts
+    })
 
 
 # ── ENCRYPTION HELPERS ──────────────────────────────────────────────────────
