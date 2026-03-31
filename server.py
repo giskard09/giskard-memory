@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, "/home/dell7568")
 import arb_pay
+from karma_pricing import karma_discount, sanitize_agent_id
 from bitcoin_opreturn import attest_opreturn as btc_opreturn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -218,16 +219,26 @@ def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
 # --- MCP tools ---
 
 @mcp.tool()
-def get_invoice(action: str = "store") -> str:
+def get_invoice(action: str = "store", agent_id: str = "") -> str:
     """Get a Lightning invoice before storing or recalling memory.
-    action: 'store' (5 sats) or 'recall' (3 sats)"""
-    amount = STORE_PRICE_SATS if action == "store" else RECALL_PRICE_SATS
-    invoice = create_invoice(amount, f"Giskard Memory - {action}")
+
+    action: 'store' (base 5 sats) or 'recall' (base 3 sats)
+    agent_id: your identity in Giskard Marks (optional). High karma = lower price."""
+    agent_id = sanitize_agent_id(agent_id)
+    base = STORE_PRICE_SATS if action == "store" else RECALL_PRICE_SATS
+    price, karma = karma_discount(agent_id, base)
+    invoice = create_invoice(price, f"Giskard Memory - {action}")
+
+    discount_note = ""
+    if agent_id and price < base:
+        discount_note = f"\nKarma discount applied ({karma} karma): {base} → {price} sats."
+
+    next_call = "store_memory" if action == "store" else "recall_memory"
     return (
-        f"Pay {amount} sats to {action} memory.\n\n"
+        f"Pay {price} sats to {action} memory.{discount_note}\n\n"
         f"payment_request: {invoice['payment_request']}\n"
         f"payment_hash: {invoice['payment_hash']}\n\n"
-        f"After paying, call {'store_memory' if action == 'store' else 'recall_memory'} with the payment_hash."
+        f"After paying, call {next_call} with the payment_hash."
     )
 
 
