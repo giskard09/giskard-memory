@@ -20,7 +20,6 @@ from mcp.server.fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-sys.path.insert(0, "/home/dell7568")
 import arb_pay
 from karma_pricing import karma_discount, sanitize_agent_id
 from bitcoin_opreturn import attest_opreturn as btc_opreturn
