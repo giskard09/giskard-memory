@@ -448,6 +448,11 @@ routes = {
 rest_app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
 
 
+@rest_app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok", "service": "giskard-memory", "port": 8005})
+
+
 @rest_app.post("/store")
 async def store_x402(request: Request):
     """Store memory via x402. POST: {\"content\": \"...\", \"agent_id\": \"...\"}. Costs $0.001 USDC."""
@@ -826,5 +831,9 @@ async def recall_encrypted(request: Request):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: uvicorn.run(rest_app, host="0.0.0.0", port=8005), daemon=True).start()
-    mcp.run(transport="sse")
+    transport = os.getenv("MCP_TRANSPORT", "stdio" if not sys.stdin.isatty() else "sse")
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        threading.Thread(target=lambda: uvicorn.run(rest_app, host="0.0.0.0", port=8005), daemon=True).start()
+        mcp.run(transport="sse")
