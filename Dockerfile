@@ -18,7 +18,8 @@ RUN pip install --no-cache-dir \
 
 COPY . .
 
-ENV ALBY_API_KEY=""
+ENV PHOENIXD_URL=http://host.docker.internal:9740
+ENV PHOENIXD_PASSWORD=""
 ENV ANTHROPIC_API_KEY=""
 
 EXPOSE 8005
