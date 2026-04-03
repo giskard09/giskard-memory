@@ -58,7 +58,7 @@ pip install mcp httpx chromadb sentence-transformers python-dotenv
 
 Create a `.env` file:
 ```
-ALBY_API_KEY=your_alby_api_key
+PHOENIXD_PASSWORD=your_phoenixd_password
 ```
 
 Start the server:
@@ -88,7 +88,7 @@ Semantic search finds meaning. That's what memory should do.
 - [MCP](https://modelcontextprotocol.io) — Model Context Protocol
 - [ChromaDB](https://www.trychroma.com) — vector database
 - [Sentence Transformers](https://www.sbert.net) — semantic embeddings
-- [Alby](https://getalby.com) — Lightning Network payments
+- [phoenixd](https://phoenix.acinq.co/server) — Lightning Network payments
 - [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — public exposure
 
 ---
