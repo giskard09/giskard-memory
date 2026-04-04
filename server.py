@@ -46,12 +46,24 @@ mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=8001)
 
 FEEDBACK_FILE = Path(__file__).parent / "feedback.jsonl"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+_claude = None
+def get_claude():
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude
 
 client = chromadb.PersistentClient(path="./memory_db")
 collection      = client.get_or_create_collection("agent_memory")
 collection_comp = client.get_or_create_collection("agent_memory_compressed")
-model = SentenceTransformer("all-MiniLM-L6-v2")
+
+_model = None
+def get_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _model
 
 COMPRESS_SYSTEM = """You are a semantic compression engine for agent memory.
 Given a text, produce a compact representation using this format:
@@ -96,7 +108,7 @@ def check_invoice(payment_hash: str) -> bool:
 
 def do_compress(content: str) -> dict:
     """Comprime contenido usando Claude Haiku. Retorna compressed, schema, expand."""
-    msg = claude.messages.create(
+    msg = get_claude().messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         system=COMPRESS_SYSTEM,
@@ -176,7 +188,7 @@ def attest_lightning(commitment_hash: str) -> dict | None:
 def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
     timestamp  = int(time.time())
     commitment = compute_commitment(content, agent_id, timestamp)
-    embedding  = model.encode(content).tolist()
+    embedding  = get_model().encode(content).tolist()
     memory_id  = str(uuid.uuid4())
     collection.add(
         ids=[memory_id],
@@ -203,7 +215,7 @@ def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
 
 
 def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
-    embedding = model.encode(query).tolist()
+    embedding = get_model().encode(query).tolist()
     results = collection.query(
         query_embeddings=[embedding],
         n_results=n_results,
@@ -364,7 +376,7 @@ def store_compressed(content: str, agent_id: str, payment_hash: str = "", tx_has
 
     compressed = do_compress(content)
     memory_id  = str(uuid.uuid4())
-    embedding  = model.encode(compressed["expand"]).tolist()
+    embedding  = get_model().encode(compressed["expand"]).tolist()
 
     collection_comp.add(
         ids=[memory_id],
@@ -404,7 +416,7 @@ def recall_compressed(query: str, agent_id: str, expand: bool = True,
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
 
-    embedding = model.encode(query).tolist()
+    embedding = get_model().encode(query).tolist()
     results   = collection_comp.query(
         query_embeddings=[embedding],
         n_results=3,
@@ -506,7 +518,7 @@ async def store_compressed_direct(request: Request):
         return JSONResponse({"error": "content required"}, status_code=400)
     compressed = do_compress(content)
     memory_id  = str(uuid.uuid4())
-    embedding  = model.encode(compressed["expand"]).tolist()
+    embedding  = get_model().encode(compressed["expand"]).tolist()
     collection_comp.add(
         ids=[memory_id],
         embeddings=[embedding],
@@ -751,7 +763,7 @@ async def store_encrypted(request: Request):
 
     # Build searchable document from keywords only
     searchable = " ".join(keywords) if keywords else f"encrypted memory agent:{agent_id}"
-    embedding  = model.encode(searchable).tolist()
+    embedding  = get_model().encode(searchable).tolist()
     memory_id  = str(uuid.uuid4())
     timestamp  = int(time.time())
     commitment = compute_commitment(json.dumps(encrypted_blob), agent_id, timestamp)
@@ -800,7 +812,7 @@ async def recall_encrypted(request: Request):
     if not query or not agent_id:
         return JSONResponse({"error": "query and agent_id required"}, status_code=400)
 
-    embedding = model.encode(query).tolist()
+    embedding = get_model().encode(query).tolist()
     results   = collection.query(
         query_embeddings=[embedding],
         n_results=n,
