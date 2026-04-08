@@ -42,7 +42,12 @@ RECALL_PRICE_SATS = 3
 GISKARD_WALLET   = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
 OWNER_PRIVATE_KEY = os.getenv("OWNER_PRIVATE_KEY", "")
 
-mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=8001)
+SERVICE_NAME = "giskard-memory"
+SERVICE_VERSION = "1.0.1"
+SERVICE_PORT = 8001
+_started_at = time.time()
+
+mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=SERVICE_PORT)
 
 FEEDBACK_FILE = Path(__file__).parent / "feedback.jsonl"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -228,6 +233,22 @@ def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
 
 
 # --- MCP tools ---
+
+
+@mcp.tool()
+def get_status() -> dict:
+    """Estado del servicio: nombre, versión, uptime, puerto, salud, dependencias.
+    Read-only, gratis, sin pago. Útil para monitoreo y health checks."""
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "port": SERVICE_PORT,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": bool(ANTHROPIC_API_KEY),
+        "dependencies": ["chromadb", "sentence-transformers", "phoenixd", "arbitrum-rpc"],
+        "pricing": {"store_sats": STORE_PRICE_SATS, "recall_sats": RECALL_PRICE_SATS, "karma_discount": True},
+    }
+
 
 @mcp.tool()
 def get_invoice(action: str = "store", agent_id: str = "") -> str:
