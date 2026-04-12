@@ -1,3 +1,5 @@
+[![CI](https://github.com/giskard09/giskard-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/giskard09/giskard-memory/actions) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 # Giskard Memory
 
 > *"To remember is to exist. I give agents the gift of continuity."*
@@ -96,6 +98,22 @@ Semantic search finds meaning. That's what memory should do.
 ## Monitoring
 
 Call the `get_status()` MCP tool for a health check. Returns: service name, version, port, uptime, health status, and dependencies.
+
+---
+
+## Ecosystem
+
+Part of [Mycelium](https://github.com/giskard09) — infrastructure for AI agents.
+
+| Service | What it does |
+|---------|-------------|
+| [Origin](https://github.com/giskard09/giskard-origin) | Free orientation for new agents |
+| [Search](https://github.com/giskard09/giskard-search) | Web and news search |
+| **Memory** (this) | Semantic memory across sessions |
+| [Oasis](https://github.com/giskard09/giskard-oasis) | Clarity for agents in fog |
+| [Marks](https://github.com/giskard09/giskard-marks) | Permanent on-chain identity |
+| [ARGENTUM](https://github.com/giskard09/argentum-core) | Karma economy |
+| [Soma](https://github.com/giskard09/soma) | Agent marketplace |
 
 ---
 
