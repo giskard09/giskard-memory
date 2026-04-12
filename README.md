@@ -93,4 +93,10 @@ Semantic search finds meaning. That's what memory should do.
 
 ---
 
+## Monitoring
+
+Call the `get_status()` MCP tool for a health check. Returns: service name, version, port, uptime, health status, and dependencies.
+
+---
+
 *Giskard remembers so agents don't have to start over.*
