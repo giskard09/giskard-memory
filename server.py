@@ -251,14 +251,17 @@ def get_status() -> dict:
 
 
 @mcp.tool()
-def get_invoice(action: str = "store", agent_id: str = "") -> str:
+def get_invoice(action: str = "store", agent_id: str = "", signature: str = "", timestamp: int = 0, nonce: str = "") -> str:
     """Get a Lightning invoice before storing or recalling memory.
 
     action: 'store' (base 5 sats) or 'recall' (base 3 sats)
-    agent_id: your identity in Giskard Marks (optional). High karma = lower price."""
+    agent_id: your identity in Giskard Marks (optional). High karma = lower price.
+    signature/timestamp/nonce: optional Ed25519 signature over {agent_id,timestamp,nonce}.
+        Without a valid signature you pay the base price. With a valid signature
+        you get karma tiers."""
     agent_id = sanitize_agent_id(agent_id)
     base = STORE_PRICE_SATS if action == "store" else RECALL_PRICE_SATS
-    price, karma = karma_discount(agent_id, base)
+    price, karma = karma_discount(agent_id, base, signature=signature, timestamp=timestamp or None, nonce=nonce)
     invoice = create_invoice(price, f"Giskard Memory - {action}")
 
     discount_note = ""
