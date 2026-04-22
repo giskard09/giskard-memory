@@ -21,7 +21,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 import arb_pay
-from karma_pricing import karma_discount, sanitize_agent_id
+from karma_pricing import karma_discount_signed, sanitize_agent_id
 from bitcoin_opreturn import attest_opreturn as btc_opreturn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -261,7 +261,7 @@ def get_invoice(action: str = "store", agent_id: str = "", signature: str = "", 
         you get karma tiers."""
     agent_id = sanitize_agent_id(agent_id)
     base = STORE_PRICE_SATS if action == "store" else RECALL_PRICE_SATS
-    price, karma = karma_discount(agent_id, base, signature=signature, timestamp=timestamp or None, nonce=nonce)
+    price, karma, _ = karma_discount_signed(agent_id, base, signature=signature, timestamp=timestamp or None, nonce=nonce)
     invoice = create_invoice(price, f"Giskard Memory - {action}")
 
     discount_note = ""
