@@ -50,6 +50,20 @@ _started_at = time.time()
 
 mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=SERVICE_PORT)
 
+from starlette.routing import Route as _StarletteRoute
+from starlette.responses import JSONResponse as _StarletteJSON
+from starlette.requests import Request as _StarletteRequest
+
+async def _status_handler(request: _StarletteRequest):
+    return _StarletteJSON({
+        "service": SERVICE_NAME, "version": SERVICE_VERSION, "port": SERVICE_PORT,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": bool(ANTHROPIC_API_KEY),
+        "dependencies": ["chromadb", "sentence-transformers", "phoenixd", "arbitrum-rpc"],
+    })
+
+mcp._custom_starlette_routes.append(_StarletteRoute("/status", _status_handler))
+
 FEEDBACK_FILE = Path(__file__).parent / "feedback.jsonl"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 TRAILS_DB = str(Path(__file__).parent / "trails.db")
