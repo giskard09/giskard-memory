@@ -21,6 +21,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 import arb_pay
+import mycelium_trails
 from karma_pricing import karma_discount_signed, sanitize_agent_id
 from bitcoin_opreturn import attest_opreturn as btc_opreturn
 from fastapi import FastAPI, Request
@@ -51,6 +52,12 @@ mcp = FastMCP("Giskard Memory", host="0.0.0.0", port=SERVICE_PORT)
 
 FEEDBACK_FILE = Path(__file__).parent / "feedback.jsonl"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+TRAILS_DB = str(Path(__file__).parent / "trails.db")
+TRAILS_ENABLED = os.getenv("MYCELIUM_TRAILS_ENABLED", "true").lower() != "false"
+if TRAILS_ENABLED:
+    mycelium_trails.init_db(TRAILS_DB)
+
+_invoice_meta: dict = {}
 
 _claude = None
 def get_claude():
@@ -140,20 +147,29 @@ def attest_onchain(commitment_hash: str) -> str | None:
     """Publica el commitment hash en Arbitrum como tx data (0 ETH). Retorna tx_hash o None."""
     try:
         arb_pay._setup()
-        if not arb_pay._w3 or not arb_pay._owner:
+        if not arb_pay._w3 or not arb_pay._owner_addr:
             return None
         w3 = arb_pay._w3
         tx = {
-            "from":     arb_pay._owner.address,
-            "to":       arb_pay._owner.address,
+            "from":     arb_pay._owner_addr,
+            "to":       arb_pay._owner_addr,
             "value":    0,
             "data":     "0x" + commitment_hash,
             "gas":      25_000,
             "gasPrice": w3.eth.gas_price,
-            "nonce":    w3.eth.get_transaction_count(arb_pay._owner.address),
+            "nonce":    w3.eth.get_transaction_count(arb_pay._owner_addr),
         }
-        signed  = w3.eth.account.sign_transaction(tx, arb_pay.OWNER_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        if arb_pay.USE_SIGNER:
+            tx.setdefault("chainId", arb_pay.SIGNER_CHAIN_ID)
+            raw_hex = arb_pay._signer_client.sign_transaction(
+                arb_pay.SIGNER_WALLET_ID, tx
+            )["raw_transaction"]
+            if raw_hex.startswith("0x"):
+                raw_hex = raw_hex[2:]
+            tx_hash = w3.eth.send_raw_transaction(bytes.fromhex(raw_hex))
+        else:
+            signed  = w3.eth.account.sign_transaction(tx, arb_pay.OWNER_PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         return tx_hash.hex()
     except Exception:
         return None
@@ -161,17 +177,26 @@ def attest_onchain(commitment_hash: str) -> str | None:
 
 def attest_signed(commitment_hash: str, timestamp: int) -> dict | None:
     """Firma el commitment con la clave secp256k1 de Giskard. Verificable por cualquiera sin gas."""
-    if not OWNER_PRIVATE_KEY:
-        return None
     try:
         arb_pay._setup()
         message = f"giskard-memory:commitment:{commitment_hash}:timestamp:{timestamp}"
-        msg     = encode_defunct(text=message)
-        signed  = arb_pay._w3.eth.account.sign_message(msg, private_key=OWNER_PRIVATE_KEY)
+        if arb_pay.USE_SIGNER:
+            sig = arb_pay._signer_client.sign_message(
+                arb_pay.SIGNER_WALLET_ID, message
+            )
+            signature_hex = sig["signature"]
+            signer_addr = sig["address"]
+        else:
+            if not OWNER_PRIVATE_KEY:
+                return None
+            msg     = encode_defunct(text=message)
+            signed  = arb_pay._w3.eth.account.sign_message(msg, private_key=OWNER_PRIVATE_KEY)
+            signature_hex = signed.signature.hex()
+            signer_addr = GISKARD_WALLET
         return {
             "message":   message,
-            "signature": signed.signature.hex(),
-            "signer":    GISKARD_WALLET,
+            "signature": signature_hex,
+            "signer":    signer_addr,
         }
     except Exception:
         return None
@@ -210,7 +235,15 @@ def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
         attestations["signed"]    = attest_signed(commitment, timestamp)
         attestations["lightning"] = attest_lightning(commitment)
         attestations["arbitrum"]  = attest_onchain(commitment)
-        attestations["bitcoin"]   = btc_opreturn(commitment, OWNER_PRIVATE_KEY) if OWNER_PRIVATE_KEY else None
+        if arb_pay.USE_SIGNER:
+            def _btc_sign_fn(sighash: bytes, _wid=arb_pay.SIGNER_WALLET_ID):
+                r = arb_pay._signer_client.sign_btc_sighash(_wid, sighash.hex())
+                return bytes.fromhex(r["der_sig_hex"]), bytes.fromhex(r["pubkey_compressed_hex"])
+            attestations["bitcoin"] = btc_opreturn(commitment, sign_fn=_btc_sign_fn)
+        elif OWNER_PRIVATE_KEY:
+            attestations["bitcoin"] = btc_opreturn(commitment, privkey_hex=OWNER_PRIVATE_KEY)
+        else:
+            attestations["bitcoin"] = None
     return {
         "memory_id":   memory_id,
         "commitment":  commitment,
@@ -261,8 +294,10 @@ def get_invoice(action: str = "store", agent_id: str = "", signature: str = "", 
         you get karma tiers."""
     agent_id = sanitize_agent_id(agent_id)
     base = STORE_PRICE_SATS if action == "store" else RECALL_PRICE_SATS
-    price, karma, _ = karma_discount_signed(agent_id, base, signature=signature, timestamp=timestamp or None, nonce=nonce)
+    price, karma, sig_verified = karma_discount_signed(agent_id, base, signature=signature, timestamp=timestamp or None, nonce=nonce)
     invoice = create_invoice(price, f"Giskard Memory - {action}")
+    if sig_verified and agent_id and TRAILS_ENABLED:
+        _invoice_meta[invoice["payment_hash"]] = {"agent_id": agent_id, "karma": karma, "nonce": nonce, "action": action}
 
     discount_note = ""
     if agent_id and price < base:
@@ -306,6 +341,7 @@ def store_memory(content: str, agent_id: str, payment_hash: str = "", tx_hash: s
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
     result = do_store(content, agent_id)
+    _record_trail(payment_hash, "store_memory")
     return f"Memory stored.\nID: {result['memory_id']}\nCommitment: {result['commitment']}"
 
 
@@ -322,6 +358,7 @@ def recall_memory(query: str, agent_id: str, payment_hash: str = "", tx_hash: st
         arb_pay.mark_used(pid)
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
+    _record_trail(payment_hash, "recall_memory")
     return do_recall(query, agent_id, n_results)
 
 
@@ -463,6 +500,26 @@ def recall_compressed(query: str, agent_id: str, expand: bool = True,
     return "\n---\n".join(output)
 
 
+def _record_trail(payment_hash: str, operation: str) -> None:
+    if not TRAILS_ENABLED:
+        return
+    meta = _invoice_meta.pop(payment_hash, None)
+    if not meta:
+        return
+    try:
+        mycelium_trails.record_trail(
+            TRAILS_DB,
+            agent_id=meta["agent_id"],
+            service=SERVICE_NAME,
+            operation=operation,
+            nonce=meta["nonce"],
+            karma_at_time=meta["karma"],
+            success=True,
+        )
+    except Exception:
+        pass
+
+
 # --- x402 REST API (USDC on Base Sepolia) ---
 
 rest_app = FastAPI(title="Giskard Memory REST")
@@ -482,6 +539,18 @@ routes = {
 }
 
 rest_app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
+
+
+@rest_app.get("/status")
+async def status_rest():
+    return JSONResponse({
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "port": SERVICE_PORT,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": bool(ANTHROPIC_API_KEY),
+        "dependencies": ["chromadb", "sentence-transformers", "phoenixd", "arbitrum-rpc"],
+    })
 
 
 @rest_app.get("/health")
@@ -864,6 +933,30 @@ async def recall_encrypted(request: Request):
             pass
 
     return JSONResponse({"results": out, "note": "Decrypt locally with your key. Giskard cannot read this."})
+
+
+@rest_app.get("/trails/{agent_id}")
+async def trails_by_agent(agent_id: str, limit: int = 50):
+    if not TRAILS_ENABLED:
+        return JSONResponse({"error": "trails disabled"}, status_code=404)
+    rows = mycelium_trails.list_trails_by_agent(TRAILS_DB, agent_id, limit=limit)
+    return {"agent_id": agent_id, "count": len(rows), "trails": rows}
+
+
+@rest_app.get("/trails")
+async def trails_feed(service: str = "", since: int = 0, limit: int = 200):
+    if not TRAILS_ENABLED:
+        return JSONResponse({"error": "trails disabled"}, status_code=404)
+    rows = mycelium_trails.list_trails_by_service(TRAILS_DB, service=service or None, since_ts=since, limit=limit)
+    return {"service": service or "all", "since": since, "count": len(rows), "trails": rows}
+
+
+@rest_app.get("/trails/count/{agent_id}")
+async def trails_count(agent_id: str):
+    if not TRAILS_ENABLED:
+        return JSONResponse({"error": "trails disabled"}, status_code=404)
+    n = mycelium_trails.count_trails_today(TRAILS_DB, agent_id)
+    return {"agent_id": agent_id, "trails_today": n}
 
 
 if __name__ == "__main__":
