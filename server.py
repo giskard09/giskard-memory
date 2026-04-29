@@ -60,7 +60,7 @@ async def _status_handler(request: _StarletteRequest):
         "uptime_seconds": int(time.time() - _started_at),
         "healthy": bool(ANTHROPIC_API_KEY),
         "dependencies": ["chromadb", "sentence-transformers", "phoenixd", "arbitrum-rpc"],
-    })
+    }, headers={"Access-Control-Allow-Origin": "*"})
 
 mcp._custom_starlette_routes.append(_StarletteRoute("/status", _status_handler))
 
