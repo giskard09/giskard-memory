@@ -1,0 +1,12 @@
+anthropic
+chromadb
+cryptography
+eth-account
+fastapi
+httpx
+mcp
+python-dotenv
+sentence-transformers
+uvicorn
+web3
+x402
