@@ -3,6 +3,7 @@ import sys
 import uuid
 import json
 import time
+import hmac
 import hashlib
 import httpx
 import anthropic
@@ -36,6 +37,7 @@ import threading
 
 load_dotenv()
 
+MEMORY_API_KEY    = os.getenv("MEMORY_API_KEY", "")
 PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD")
 PHOENIXD_URL = "http://127.0.0.1:9740"
 STORE_PRICE_SATS = 5
@@ -60,7 +62,7 @@ async def _status_handler(request: _StarletteRequest):
         "uptime_seconds": int(time.time() - _started_at),
         "healthy": bool(ANTHROPIC_API_KEY),
         "dependencies": ["chromadb", "sentence-transformers", "phoenixd", "arbitrum-rpc"],
-    })
+    }, headers={"Access-Control-Allow-Origin": "*"})
 
 mcp._custom_starlette_routes.append(_StarletteRoute("/status", _status_handler))
 
@@ -229,20 +231,23 @@ def attest_lightning(commitment_hash: str) -> dict | None:
         return None
 
 
-def do_store(content: str, agent_id: str, attest: bool = False) -> dict:
+def do_store(content: str, agent_id: str, attest: bool = False, action_ref: str = "") -> dict:
     timestamp  = int(time.time())
     commitment = compute_commitment(content, agent_id, timestamp)
     embedding  = get_model().encode(content).tolist()
     memory_id  = str(uuid.uuid4())
+    meta = {
+        "agent_id":   agent_id,
+        "commitment": commitment,
+        "timestamp":  timestamp,
+    }
+    if action_ref:
+        meta["action_ref"] = action_ref
     collection.add(
         ids=[memory_id],
         embeddings=[embedding],
         documents=[content],
-        metadatas=[{
-            "agent_id":   agent_id,
-            "commitment": commitment,
-            "timestamp":  timestamp,
-        }],
+        metadatas=[meta],
     )
     attestations = {}
     if attest:
@@ -272,11 +277,17 @@ def do_recall(query: str, agent_id: str, n_results: int = 3) -> str:
         query_embeddings=[embedding],
         n_results=n_results,
         where={"agent_id": agent_id},
+        include=["documents", "metadatas"],
     )
-    docs = results.get("documents", [[]])[0]
+    docs  = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
     if not docs:
         return "No memories found for this agent."
-    return "\n---\n".join(docs)
+    parts = []
+    for doc, meta in zip(docs, metas):
+        action_ref = meta.get("action_ref", "") if meta else ""
+        parts.append(f"{doc}\n[action_ref: {action_ref}]" if action_ref else doc)
+    return "\n---\n".join(parts)
 
 
 # --- MCP tools ---
@@ -342,8 +353,9 @@ def get_arbitrum_invoice(action: str = "store") -> str:
 
 
 @mcp.tool()
-def store_memory(content: str, agent_id: str, payment_hash: str = "", tx_hash: str = "") -> str:
-    """Store a memory for an agent. Pay with Lightning (payment_hash) or Arbitrum ETH (tx_hash)."""
+def store_memory(content: str, agent_id: str, payment_hash: str = "", tx_hash: str = "", action_ref: str = "") -> str:
+    """Store a memory for an agent. Pay with Lightning (payment_hash) or Arbitrum ETH (tx_hash).
+    Optional: action_ref (string) — content-addressed provenance of the action that triggered this store."""
     if payment_hash:
         if not check_invoice(payment_hash):
             return "Lightning payment not settled. Call get_invoice(action='store') first."
@@ -354,7 +366,7 @@ def store_memory(content: str, agent_id: str, payment_hash: str = "", tx_hash: s
         arb_pay.mark_used(pid)
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
-    result = do_store(content, agent_id)
+    result = do_store(content, agent_id, action_ref=action_ref)
     _record_trail(payment_hash, "store_memory")
     return f"Memory stored.\nID: {result['memory_id']}\nCommitment: {result['commitment']}"
 
@@ -601,10 +613,12 @@ async def recall_x402(request: Request):
     return JSONResponse({"memories": do_recall(query, agent_id)})
 
 
-# --- Internal endpoints (sin pago — solo localhost) ---
+# --- Internal endpoints (sin pago — solo localhost o API key) ---
 
 def _is_internal(request: Request) -> bool:
-    """True solo si la request viene de localhost real, no de un túnel Cloudflare."""
+    """True si viene de localhost real (sin túnel) o tiene X-Api-Key válida."""
+    if MEMORY_API_KEY and hmac.compare_digest(request.headers.get("x-api-key", ""), MEMORY_API_KEY):
+        return True
     if request.client.host not in ("127.0.0.1", "::1"):
         return False
     # Cloudflare tunnel conecta desde localhost pero agrega CF-Connecting-IP
@@ -641,11 +655,12 @@ async def store_direct(request: Request):
     if not _is_internal(request):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body = await request.json()
-    content  = body.get("content", "")
-    agent_id = body.get("agent_id", "giskard-self")
+    content    = body.get("content", "")
+    agent_id   = body.get("agent_id", "giskard-self")
+    action_ref = body.get("action_ref", "")
     if not content:
         return JSONResponse({"error": "content required"}, status_code=400)
-    result = do_store(content, agent_id)
+    result = do_store(content, agent_id, action_ref=action_ref)
     return JSONResponse({"memory_id": result["memory_id"], "commitment": result["commitment"]})
 
 
