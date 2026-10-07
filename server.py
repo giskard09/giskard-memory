@@ -46,7 +46,7 @@ GISKARD_WALLET   = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
 OWNER_PRIVATE_KEY = os.getenv("OWNER_PRIVATE_KEY", "")
 
 SERVICE_NAME = "giskard-memory"
-SERVICE_VERSION = "1.0.1"
+SERVICE_VERSION = "1.0.2"
 SERVICE_PORT = 8001
 _started_at = time.time()
 
